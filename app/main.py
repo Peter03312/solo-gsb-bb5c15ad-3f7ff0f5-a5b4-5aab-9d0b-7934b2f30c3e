@@ -1,5 +1,5 @@
 """HTTP API：上传、标注（乐观锁修订）、发布（事务内涂实）、撤回、公开读取、
-离线交付包与服务数据归档（同一数据库快照）。"""
+离线交付包、服务数据归档（同一数据库快照）与归档接收方核验（纯内存只读）。"""
 from __future__ import annotations
 
 import hashlib
@@ -14,7 +14,9 @@ from typing import Any
 
 from fastapi import BackgroundTasks, Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
+from starlette.concurrency import run_in_threadpool
 
+from . import archive_verify
 from .config import Settings
 from .db import init_db, read_tx, snapshot_tx, write_tx
 from .imaging import (
@@ -1770,6 +1772,66 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             media_type="application/zip",
             filename=f"service-data-archive-{stamp}.zip",
         )
+
+    # ---------------- 服务数据归档核验（接收方交接前，纯内存只读） ----------------
+
+    @app.post("/service-data-archive-verifications")
+    async def verify_service_data_archive(
+        file: UploadFile = File(...),
+    ) -> dict:
+        """核验收到的服务数据归档 ZIP（运维交接前，multipart 字段名 ``file``）。
+
+        核验**全程在内存中进行**：不解压到服务数据目录，不读取也不改写
+        服务的任何现有记录与文件——归档是否完整可信完全由包内
+        ``manifest.json`` 与五类记录文件自证。核对 ZIP 成员名唯一且均为
+        规定的相对路径、清单与实际成员一一对应、计数及 SHA-256 匹配，
+        以及文档 ↔ 连续标注修订、发布版本、批次成员顺序、撤回记录的引用
+        关系和原图/成品摘要与记录的一致性。
+
+        全部通过返回 ``200`` 与各类记录计数及通过结论；任何缺项、重复项、
+        摘要错误或关系冲突都返回 ``422``，``detail.failures`` 逐条给出
+        可定位的原因，整体判失败。
+        """
+        data = await file.read()
+        if not data:
+            _error(400, "empty_upload", "uploaded file is empty")
+        if len(data) > settings.max_verify_bytes:
+            _error(
+                413,
+                "payload_too_large",
+                f"file is {len(data)} bytes, limit is"
+                f" {settings.max_verify_bytes}",
+            )
+        # 核验为 CPU 密集的纯函数（逐成员复算 SHA-256），放到线程池执行，
+        # 不阻塞事件循环；声明的解压后总大小上限取上传上限的 4 倍，
+        # 既容忍记录 JSON 的高压缩率，又拦截 ZIP 炸弹。
+        result = await run_in_threadpool(
+            archive_verify.verify_service_data_archive,
+            data,
+            max_uncompressed_bytes=settings.max_verify_bytes * 4,
+        )
+        if not result["valid"]:
+            extra: dict[str, Any] = {
+                "failure_count": result["failure_count"],
+                "failures": result["failures"],
+            }
+            truncated = result["failure_count"] - len(result["failures"])
+            if truncated > 0:
+                extra["failures_truncated"] = truncated
+            _error(
+                422,
+                "archive_verification_failed",
+                f"the archive failed {result['failure_count']} verification"
+                " check(s); see 'failures' for the locatable reasons",
+                **extra,
+            )
+        return {
+            "valid": True,
+            "verdict": "pass",
+            "generated_at": result["generated_at"],
+            "record_counts": result["record_counts"],
+            "file_count": result["file_count"],
+        }
 
     return app
 

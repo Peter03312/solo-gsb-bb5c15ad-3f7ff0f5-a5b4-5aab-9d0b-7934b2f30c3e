@@ -23,6 +23,10 @@ class Settings:
     max_upload_bytes: int = field(
         default_factory=lambda: _int_env("MAX_UPLOAD_MB", 25) * 1024 * 1024
     )
+    # 归档核验上传大小上限（字节），由 MAX_VERIFY_MB 换算
+    max_verify_bytes: int = field(
+        default_factory=lambda: _int_env("MAX_VERIFY_MB", 512) * 1024 * 1024
+    )
 
     @property
     def db_path(self) -> str:

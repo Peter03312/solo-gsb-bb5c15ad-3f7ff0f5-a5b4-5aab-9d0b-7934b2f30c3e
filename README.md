@@ -50,6 +50,7 @@ python -m pytest tests/ -q
 | --------------- | -------- | ------------------------------------------ |
 | `DATA_DIR`      | `./data`（容器内 `/data`） | SQLite 库、原图、发布成品的存放根目录 |
 | `MAX_UPLOAD_MB` | `25`     | 单个上传文件大小上限（MB）                 |
+| `MAX_VERIFY_MB` | `512`    | 归档核验上传的 ZIP 大小上限（MB）          |
 
 监听地址/端口通过 uvicorn 参数（`--host`/`--port`）或 Compose 的 `ports` 映射调整。
 首次启动时应用自动建目录、建表（初始化无需手工步骤）。
@@ -74,6 +75,7 @@ python -m pytest tests/ -q
 | POST | `/documents/{doc_id}/coverage-diff` | **重发前遮盖范围比较**（只读）：当前标注修订号 + 基准发布版本号 → 新增/失去遮盖像素数、占旋正后图像比例、失去遮盖水平段 |
 | POST | `/publication-packages` | **离线交付包**：按请求顺序提交 2～20 个互不重复的 `(doc_id, version)`，成功返回 ZIP（各版 PNG + `manifest.json` 清单）；任一项未知/未到公开时间/已撤回即整包拒绝 |
 | POST | `/service-data-archives` | **服务数据归档（运维）**：无请求体，返回同一数据库快照的 ZIP——文档/标注/发布/撤回记录 + 该快照引用的原图与发布成品（相对路径）+ `manifest.json`（SHA-256、文档/版本标识、文件数）；任一引用文件缺失或摘要不符即整单拒绝 |
+| POST | `/service-data-archive-verifications` | **服务数据归档核验（运维接收方）**：multipart 上传归档 ZIP（字段名 `file`），纯内存核对成员名/清单/计数/SHA-256/引用关系；有效 `200` 返回各类记录计数与通过结论，否则 `422` 逐条给出可定位原因并整体判失败 |
 
 ## 调用示例（curl）
 
@@ -632,6 +634,97 @@ curl -sS -X POST "$BASE/service-data-archives"
 端到端示例（含批次定时发布、撤回、清单摘要校验与原图缺失整单拒绝）：
 `DATA_DIR=./data bash examples/demo_archive.sh`。
 
+## 服务数据归档核验（接收方交接前：纯内存、不解压、不改写）
+
+运维收到本服务生成的归档 ZIP 后、交接前，调用
+`POST /service-data-archive-verifications`（multipart 字段名 `file`）
+核验归档是否完整可信。核验**全程在内存中进行**：**不解压到服务数据
+目录，不读取也不改写服务的任何现有记录与文件**——归档是否可信完全由
+包内 `manifest.json` 与五类记录文件自证。
+
+```bash
+BASE=http://localhost:8000
+curl -sS -o archive.zip -X POST "$BASE/service-data-archives"   # 先取得归档
+curl -sS -F "file=@archive.zip" "$BASE/service-data-archive-verifications"
+# 有效 -> HTTP 200：
+# {"valid":true,"verdict":"pass","generated_at":"2026-10-06T…+00:00",
+#  "record_counts":{"documents":2,"annotation_revisions":4,"publications":2,
+#    "publication_batches":1,"withdrawals":1},"file_count":9}
+```
+
+核对内容（任一不满足即整体判失败）：
+
+- **成员名唯一且均为规定的相对路径**：只允许 5 个记录 JSON、
+  `manifest.json`、`originals/{doc_id}.png|.jpg`、
+  `publications/{doc_id}/v{n}.png`；重名成员、目录条目、绝对路径、
+  `..` 穿越、多余文件一律拒绝。
+- **清单与成员一一对应、计数与摘要匹配**：`manifest.json` 的 `files`
+  与实际成员（除清单自身）一一对应；逐文件 SHA-256、`file_count`、
+  `record_counts` 全部一致；清单条目本身的 kind/文档或版本标识/
+  `file_count` 合法且无重复。
+- **记录内部计数自洽**：各记录 JSON 的 `count`/`document_count`/
+  `revision_count`/`rect_count` 与实际条目数一致。
+- **引用关系完整**：文档 ↔ 连续标注修订（每文档 0..current_revision
+  不间断、与 documents.json 的当前修订号一致）、发布版本（每文档 1..N
+  不间断、冻结的标注修订号不超过文档当前修订、记录的原图摘要与文档
+  一致）、批次成员顺序（position 0..N-1 不间断，且与发布记录的
+  batch_id 双向互认）、撤回记录（与发布记录的 withdrawn/时间/原因
+  双向一致）。
+- **文件摘要与记录一致**：每份文档的 `original_file`、每个版本的
+  `output_file` 指向的成员存在，且字节 SHA-256 与记录的
+  `original_sha256`/`output_sha256` 一致；包内原图/成品均须被记录
+  引用（无清单外文件）。
+
+无效时返回 **422** 统一错误体，`detail.failures` 逐条给出可定位原因
+（`code`/`message` + `path`/`doc_id`/`version`/`batch_id`/`position`
+等定位字段），`failure_count` 为失败总数（逐条列出最多 100 条，超出
+部分以 `failures_truncated` 计数）：
+
+```json
+{
+  "detail": {
+    "code": "archive_verification_failed",
+    "message": "the archive failed 2 verification check(s); see 'failures' for the locatable reasons",
+    "failure_count": 2,
+    "failures": [
+      {"code": "sha256_mismatch", "path": "publications/…/v1.png",
+       "message": "SHA-256 of 'publications/…/v1.png' does not match the manifest",
+       "expected": "…", "actual": "…"},
+      {"code": "artifact_sha256_mismatch", "path": "publications/…/v1.png",
+       "doc_id": "…", "version": 1,
+       "message": "…", "expected": "…", "actual": "…"}
+    ]
+  }
+}
+```
+
+失败原因 `code` 一览（均附定位字段）：`invalid_zip`、`duplicate_member`、
+`unexpected_member`、`member_unreadable`、`manifest_missing`、
+`manifest_invalid`、`invalid_manifest_entry`、`duplicate_manifest_entry`、
+`manifest_entry_missing`、`member_missing`、`sha256_mismatch`、
+`file_count_mismatch`、`record_count_mismatch`、`records_missing`、
+`records_invalid`、`records_count_mismatch`、`revision_count_mismatch`、
+`rect_count_mismatch`、`duplicate_document`、`duplicate_publication`、
+`duplicate_withdrawal`、`duplicate_batch`、`duplicate_annotation_document`、
+`duplicate_annotation_revision`、`duplicate_batch_position`、
+`unknown_document_reference`、`unknown_publication_reference`、
+`unknown_batch_reference`、`unknown_annotation_revision`、
+`annotation_document_missing`、`annotation_revision_mismatch`、
+`annotation_revision_gap`、`publication_version_gap`、
+`publication_original_mismatch`、`batch_position_gap`、
+`batch_membership_mismatch`、`batch_member_missing`、`withdrawal_mismatch`、
+`invalid_file_reference`、`referenced_file_missing`、`unreferenced_file`、
+`original_sha256_mismatch`、`artifact_sha256_mismatch`、
+`unsupported_media_type`。
+
+上传约束：空文件 `400 empty_upload`；超过 `MAX_VERIFY_MB`（默认
+512 MB）`413 payload_too_large`；声明的解压后总大小超过上传上限 4 倍
+按 `invalid_zip` 拒绝（防 ZIP 炸弹）。核验为纯函数
+（`app/archive_verify.py`），不触库、不触盘，可安全重复调用。
+
+端到端示例（有效归档通过、篡改成品字节后 422 并逐条定位）：
+`bash examples/demo_archive_verify.sh`。
+
 
 ## 错误响应
 
@@ -673,6 +766,7 @@ curl -sS -X POST "$BASE/service-data-archives"
 | 500 | `archive_artifact_corrupt` | 归档成品实际 SHA-256 与快照记录不符（附 `doc_id`/`version`，整单拒绝） |
 | 500 | `archive_unsupported_media_type` | 归档文档的库内 media_type 不受支持（附 `doc_id`） |
 | 500 | `archive_write_failed` | 归档 ZIP 写盘失败（临时文件已清理，整单拒绝） |
+| 422 | `archive_verification_failed` | 服务数据归档核验未通过：附 `failure_count` 与逐条可定位的 `failures`（缺项/重复项/摘要错误/关系冲突），整体判失败 |
 | 413 | `payload_too_large` | 超过上传大小上限 |
 | 415 | `unsupported_media_type` | 非 PNG/JPEG（如 GIF） |
 
@@ -768,6 +862,7 @@ app/
   main.py     # FastAPI 路由与事务编排
   db.py       # SQLite 模式与事务助手（WAL + BEGIN IMMEDIATE；只读快照事务）
   imaging.py  # 解码、EXIF 旋正、涂实、去元数据渲染、矩形缩放、遮盖范围比较
+  archive_verify.py  # 服务数据归档接收方核验（纯内存、只读，不触库不触盘）
   models.py   # 请求体模型（含批次、迁移、遮盖比较请求）
   config.py   # 环境变量配置
 tests/test_api.py    # 16 个用例：含 EXIF、乐观锁、错误码、不可变性、并发一致性
@@ -789,6 +884,15 @@ tests/test_archive.py        # 12 个用例：归档相对路径结构、记录 
                              #   JPEG 扩展名不取上传名、批次与定时/撤回版本全收录、
                              #   同一快照且并发写入不阻塞不混入、原图/成品缺失损坏
                              #   整单拒绝、ZIP 写盘失败与成功后临时文件清理
+tests/test_archive_verify.py # 41 个用例：有效/空库归档通过并返回记录计数、
+                             #   非 ZIP/空上传/超大上传、成员重名/非法/穿越、
+                             #   清单缺失/不可解析/条目非法/重复、清单与成员不
+                             #   一一对应、SHA-256/file_count/record_counts 不符、
+                             #   记录内部计数、标注修订连续性与文档一致、发布
+                             #   版本连续/重复/未知引用、批次成员顺序与互认、
+                             #   撤回记录悬空/不一致/重复、文件缺失/未引用/
+                             #   路径不合规定、原图/成品摘要与记录不符、
+                             #   核验全程只读（数据目录零变化）
 tests/test_migration.py      # 20 个用例：缩放取整（floor/ceil/独立宽高）、成功
                              #   迁移与修订号 +1、原因与顺序、源与历史/发布版
                              #   不变、数量/重复/源混入目标/缺失/修订过期/源为空
@@ -805,12 +909,36 @@ examples/demo_scheduled_publication.sh  # 定时公开端到端 curl 示例
 examples/demo_withdrawal.sh  # 版本撤回端到端 curl 示例
 examples/demo_package.sh     # 离线交付包端到端 curl 示例
 examples/demo_archive.sh     # 服务数据归档端到端 curl 示例
+examples/demo_archive_verify.sh  # 归档接收方核验端到端 curl 示例
 examples/demo_migration.sh   # 遮盖方案迁移端到端 curl 示例
 examples/demo_coverage_diff.sh  # 重发前遮盖范围比较端到端 curl 示例
 Dockerfile / docker-compose.yml
 ```
 
-## 本轮变动（服务数据归档）
+## 本轮变动（服务数据归档接收方核验）
+
+- 新增 `POST /service-data-archive-verifications`：multipart 上传归档 ZIP
+  （字段名 `file`），**纯内存、只读**核验——**不解压到服务数据目录、
+  不读取也不改写任何现有记录**。有效 `200` 返回 `valid`/`verdict`/
+  `generated_at`、各类记录计数 `record_counts` 与 `file_count`；无效
+  `422 archive_verification_failed`，`detail.failures` 逐条给出可定位
+  原因（缺项、重复项、摘要错误、关系冲突，附 `path`/`doc_id`/`version`/
+  `batch_id`/`position` 等定位字段），整体判失败。
+- 核对覆盖：ZIP 成员名唯一且均为规定的相对路径；`manifest.json` 与实际
+  成员一一对应、逐文件 SHA-256、`file_count`、`record_counts` 一致；
+  五类记录内部计数自洽；文档 ↔ 连续标注修订（0..current 不间断）、
+  发布版本（每文档 1..N 不间断）、批次成员顺序（position 0..N-1 且与
+  发布记录 batch_id 双向互认）、撤回记录（与发布记录撤回字段双向一致）
+  的引用关系；原图/成品字节摘要与记录一致，且无清单外文件。
+- 新增配置 `MAX_VERIFY_MB`（默认 512）：核验上传大小上限；声明的解压后
+  总大小超过上限 4 倍按 `invalid_zip` 拒绝（防 ZIP 炸弹）。核验逻辑位于
+  `app/archive_verify.py`（纯函数，不触库不触盘），路由内联于
+  `app/main.py`；**不新增任何数据表或列**，上传、标注、发布（含定时
+  公开）、批次与幂等键、撤回、公开读取、离线交付包、服务数据归档的
+  路由、请求/响应字段及启动方式（Docker Compose / uvicorn）全部保持
+  兼容。
+
+## 历史变动（服务数据归档）
 
 - 新增 `POST /service-data-archives`：运维请求、**无请求体、纯只读**；成功
   `200` 返回 `application/zip`（下载名 `service-data-archive-<UTC时间戳>.zip`）。
