@@ -15,6 +15,7 @@ from typing import Any
 from fastapi import BackgroundTasks, Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 
+from .archive_verify import verify_archive_path
 from .config import Settings
 from .db import init_db, read_tx, snapshot_tx, write_tx
 from .imaging import (
@@ -1770,6 +1771,62 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             media_type="application/zip",
             filename=f"service-data-archive-{stamp}.zip",
         )
+
+    # ------------- 服务数据归档核验（运维交接前，纯只读、不落服务数据目录） -------------
+
+    @app.post("/service-data-archives/verify")
+    async def verify_service_data_archive(
+        file: UploadFile = File(...),
+    ) -> dict:
+        """核验一个服务数据归档 ZIP 是否完整可信（交接前调用）。
+
+        请求：``multipart/form-data``，字段名 ``file``，内容为本服务
+        ``POST /service-data-archives`` 生成的归档 ZIP。
+
+        核验**纯只读**：上传内容只流式写入**系统临时目录**中的临时文件
+        （核验完成后立即删除），**绝不解压到 ``DATA_DIR``**，不打开/写入
+        数据库，也不改写任何现有记录；全部结论只依据 ZIP 内的
+        ``manifest.json``、五类记录 JSON 与引用成员本身。
+
+        - 通过：``200 {"valid": true, "member_count", "record_counts",
+          "file_count", "issues": []}``，``record_counts`` 给出五类记录计数；
+        - 不可信：``200 {"valid": false, ..., "issues": [{code,message,...}]}``，
+          每个问题附 ``path``/``index``/``doc_id``/``version``/``field`` 等
+          可定位字段（缺项、重复项、摘要错误、关系冲突均整体判失败，
+          且尽量一次性列全）；
+        - 请求本身无效（空文件、超过 ``MAX_VERIFY_MB``、不是 ZIP）：
+          分别返回 400/413 与统一错误体，不产生任何副作用。
+        """
+        # 流式落系统临时文件，避免大归档整体驻留内存；绝不写到 DATA_DIR。
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="svc-verify-", suffix=".zip")
+        total = 0
+        too_large = False
+        try:
+            with os.fdopen(tmp_fd, "wb") as out:
+                while True:
+                    chunk = await file.read(1 << 20)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > settings.max_verify_bytes:
+                        too_large = True
+                        break
+                    out.write(chunk)
+            if too_large:
+                _error(
+                    413,
+                    "payload_too_large",
+                    f"archive is larger than the verification limit of"
+                    f" {settings.max_verify_bytes} bytes",
+                )
+            if total == 0:
+                _error(400, "empty_upload", "uploaded archive file is empty")
+            result = verify_archive_path(tmp_path)
+        finally:
+            _cleanup_tempfile(tmp_path)
+        # 核验不通过是正常的业务结论（HTTP 200 + valid=false），不是服务错误：
+        # 调用方据 valid 与 issues 决定是否接收该归档。
+        return result
 
     return app
 

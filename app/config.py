@@ -23,6 +23,12 @@ class Settings:
     max_upload_bytes: int = field(
         default_factory=lambda: _int_env("MAX_UPLOAD_MB", 25) * 1024 * 1024
     )
+    # 归档核验请求体大小上限（字节），由 MAX_VERIFY_MB 换算。
+    # 核验只读取上传的 ZIP（放在系统临时目录、核验后即删），绝不解压到
+    # DATA_DIR，也不写入数据库；该上限用于约束内存/临时盘占用。
+    max_verify_bytes: int = field(
+        default_factory=lambda: _int_env("MAX_VERIFY_MB", 512) * 1024 * 1024
+    )
 
     @property
     def db_path(self) -> str:
